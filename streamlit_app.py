@@ -1,1481 +1,1226 @@
 ```python
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
 from datetime import datetime
-from pathlib import Path
-import json
 import time
 
+from database import (
+    load_data,
+    save_data,
+    create_portfolio,
+    delete_portfolio,
+    reset_portfolio,
+    get_active_portfolio,
+    update_portfolio,
+)
+
+from market_data import (
+    search_stocks,
+    get_current_price,
+    get_bid_ask,
+    get_stock_data,
+    get_market_indices,
+)
+
+from trading import (
+    buy_stock,
+    sell_stock,
+    calculate_position_pnl,
+    calculate_portfolio_value,
+    check_stop_take_profit,
+    calculate_statistics,
+)
+
+from charts import (
+    candlestick_chart,
+    volume_chart,
+    portfolio_value_chart,
+    allocation_chart,
+    pnl_chart,
+)
+
+
 # ============================================================
-# INSTÄLLNINGAR
+# KONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="StockTrader",
+    page_title="Stock Trader",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-COMMISSION_RATE = 0.02  # 2 %
-DATA_FILE = Path("portfolios.json")
-
 
 # ============================================================
-# MÖRKT UI
+# CSS
 # ============================================================
 
-st.markdown("""
-<style>
+st.markdown(
+    """
+    <style>
+
     .stApp {
-        background-color: #0b0f14;
-        color: #e8edf3;
+        background: #0b0f14;
     }
 
-    section[data-testid="stSidebar"] {
-        background-color: #080c11;
-        border-right: 1px solid #202832;
+    [data-testid="stSidebar"] {
+        background: #0d1219;
+        border-right: 1px solid #222a35;
     }
 
     .block-container {
+        max-width: 1500px;
         padding-top: 1.5rem;
-        max-width: 1600px;
-    }
-
-    div[data-testid="stMetric"] {
-        background-color: #111720;
-        border: 1px solid #202832;
-        border-radius: 10px;
-        padding: 15px;
-    }
-
-    div[data-testid="stMetricLabel"] {
-        color: #8e9aa8;
-    }
-
-    div[data-testid="stMetricValue"] {
-        color: #f1f5f9;
-    }
-
-    .stock-card {
-        background-color: #111720;
-        border: 1px solid #202832;
-        border-radius: 10px;
-        padding: 16px;
-        margin-bottom: 10px;
-    }
-
-    .green {
-        color: #35d07f;
-    }
-
-    .red {
-        color: #ff5c6c;
-    }
-
-    .gray {
-        color: #8e9aa8;
-    }
-
-    .trade-box {
-        background-color: #111720;
-        border: 1px solid #202832;
-        border-radius: 12px;
-        padding: 20px;
+        padding-bottom: 3rem;
     }
 
     h1, h2, h3 {
-        color: #f1f5f9;
+        letter-spacing: -0.5px;
     }
 
-    button {
-        border-radius: 8px !important;
+    .metric-card {
+        background: #111820;
+        border: 1px solid #222a35;
+        border-radius: 12px;
+        padding: 18px;
+        margin-bottom: 10px;
     }
-</style>
-""", unsafe_allow_html=True)
+
+    .metric-title {
+        color: #8b96a5;
+        font-size: 13px;
+        margin-bottom: 5px;
+    }
+
+    .metric-value {
+        color: #f5f7fa;
+        font-size: 25px;
+        font-weight: 700;
+    }
+
+    .small-muted {
+        color: #7f8a99;
+        font-size: 13px;
+    }
+
+    div[data-testid="stMetric"] {
+        background: #111820;
+        border: 1px solid #222a35;
+        padding: 15px;
+        border-radius: 12px;
+    }
+
+    button[kind="primary"] {
+        border-radius: 8px;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
-# DATAHANTERING
+# HJÄLPFUNKTIONER
 # ============================================================
 
-def save_data():
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.portfolios, f, indent=4)
-    except Exception as e:
-        st.error(f"Kunde inte spara data: {e}")
+def money(value):
+    if value is None:
+        return "0,00 kr"
+
+    return f"{value:,.2f} kr".replace(",", "X").replace(".", ",").replace("X", " ")
 
 
-def load_data():
-    if DATA_FILE.exists():
+def percent(value):
+    return f"{value:+.2f}%"
+
+
+def get_prices_for_portfolio(portfolio):
+    symbols = list(portfolio.get("holdings", {}).keys())
+
+    prices = {}
+
+    for symbol in symbols:
+        price = get_current_price(symbol)
+
+        if price is not None:
+            prices[symbol] = price
+
+    return prices
+
+
+def update_value_history(portfolio):
+    prices = get_prices_for_portfolio(portfolio)
+
+    value = calculate_portfolio_value(
+        portfolio,
+        prices
+    )
+
+    history = portfolio.setdefault("value_history", [])
+
+    now = datetime.now().isoformat()
+
+    if history:
+        last = history[-1]
+
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            last_time = datetime.fromisoformat(last["timestamp"])
+
+            if (datetime.now() - last_time).total_seconds() < 10:
+                last["value"] = value
+            else:
+                history.append(
+                    {
+                        "timestamp": now,
+                        "value": value
+                    }
+                )
+
+        except Exception:
+            history.append(
+                {
+                    "timestamp": now,
+                    "value": value
+                }
+            )
+
+    else:
+        history.append(
+            {
+                "timestamp": now,
+                "value": value
+            }
+        )
+
+
+def format_transaction_table(transactions):
+    if not transactions:
+        return pd.DataFrame()
+
+    rows = []
+
+    for transaction in reversed(transactions):
+        timestamp = transaction.get("timestamp", "")
+
+        try:
+            timestamp = datetime.fromisoformat(
+                timestamp
+            ).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             pass
 
-    return {
-        "Min portfölj": {
-            "starting_balance": 50000.0,
-            "balance": 50000.0,
-            "holdings": {},
-            "transactions": [],
-            "performance": [],
-            "watchlist": ["AAPL", "NVDA", "TSLA"],
-            "created": datetime.now().isoformat()
-        }
-    }
-
-
-if "portfolios" not in st.session_state:
-    st.session_state.portfolios = load_data()
-
-if "selected_stock" not in st.session_state:
-    st.session_state.selected_stock = "AAPL"
-
-if "search_results" not in st.session_state:
-    st.session_state.search_results = []
-
-
-# ============================================================
-# HÄMTA AKTIEDATA
-# ============================================================
-
-@st.cache_data(ttl=20)
-def get_stock_data(symbol, period="1d", interval="5m"):
-    try:
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(
-            period=period,
-            interval=interval,
-            auto_adjust=False
+        rows.append(
+            {
+                "Tid": timestamp,
+                "Aktie": transaction.get("symbol", ""),
+                "Typ": transaction.get("side", ""),
+                "Antal": transaction.get("shares", 0),
+                "Pris": money(transaction.get("price", 0)),
+                "Courtage": money(transaction.get("commission", 0)),
+                "Totalt": money(transaction.get("total", 0)),
+                "P&L": (
+                    money(transaction.get("pnl", 0))
+                    if transaction.get("side") == "SELL"
+                    else "-"
+                ),
+            }
         )
 
-        if data.empty:
-            return None
-
-        data = data.dropna()
-
-        return data
-
-    except Exception:
-        return None
+    return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=60)
-def get_stock_info(symbol):
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-
-        return {
-            "name": info.get("longName", symbol),
-            "currency": info.get("currency", "USD"),
-            "exchange": info.get("exchange", ""),
-            "sector": info.get("sector", ""),
-        }
-
-    except Exception:
-        return {
-            "name": symbol,
-            "currency": "",
-            "exchange": "",
-            "sector": ""
-        }
-
-
-def get_current_price(symbol):
-    data = get_stock_data(symbol, "1d", "1m")
-
-    if data is None or data.empty:
-        return None
-
-    return float(data["Close"].iloc[-1])
-
-
-# ============================================================
-# SÖK AKTIER
-# ============================================================
-
-@st.cache_data(ttl=300)
-def search_stocks(query):
-    try:
-        search = yf.Search(query)
-        quotes = search.quotes
-
-        results = []
-
-        for quote in quotes[:10]:
-            symbol = quote.get("symbol")
-            name = quote.get("longname") or quote.get("shortname") or symbol
-
-            if symbol:
-                results.append({
-                    "symbol": symbol,
-                    "name": name,
-                    "exchange": quote.get("exchange", "")
-                })
-
-        return results
-
-    except Exception:
-        return []
-
-
-# ============================================================
-# PORTFÖLJ
-# ============================================================
-
-def current_portfolio():
-    name = st.session_state.selected_portfolio
-    return st.session_state.portfolios[name]
-
-
-def portfolio_value(portfolio):
-    value = portfolio["balance"]
-
-    for symbol, holding in portfolio["holdings"].items():
-        price = get_current_price(symbol)
-
-        if price is not None:
-            value += holding["shares"] * price
-
-    return value
-
-
-def holdings_value(portfolio):
-    total = 0
-
-    for symbol, holding in portfolio["holdings"].items():
-        price = get_current_price(symbol)
-
-        if price is not None:
-            total += holding["shares"] * price
-
-    return total
-
-
-def total_pnl(portfolio):
-    value = portfolio_value(portfolio)
-    starting = portfolio["starting_balance"]
-
-    return value - starting
-
-
-# ============================================================
-# BUY
-# ============================================================
-
-def buy_stock(symbol, shares):
-    portfolio = current_portfolio()
-
-    if shares <= 0:
-        return False, "Antalet aktier måste vara större än 0."
-
-    if int(shares) != shares:
-        return False, "Du kan endast köpa hela aktier."
-
-    shares = int(shares)
-
-    price = get_current_price(symbol)
-
-    if price is None:
-        return False, "Kunde inte hämta aktuell aktiekurs."
-
-    ask_price = price * 1.0005
-
-    subtotal = ask_price * shares
-    commission = subtotal * COMMISSION_RATE
-    total_cost = subtotal + commission
-
-    if total_cost > portfolio["balance"]:
-        return False, (
-            f"Du har inte tillräckligt med pengar. "
-            f"Totalkostnad: {total_cost:,.2f} kr"
-        )
-
-    portfolio["balance"] -= total_cost
-
-    if symbol not in portfolio["holdings"]:
-        portfolio["holdings"][symbol] = {
-            "shares": 0,
-            "avg_price": 0.0
-        }
-
-    holding = portfolio["holdings"][symbol]
-
-    old_shares = holding["shares"]
-    old_avg = holding["avg_price"]
-
-    new_shares = old_shares + shares
-
-    if new_shares > 0:
-        new_avg = (
-            (old_shares * old_avg) +
-            (shares * ask_price)
-        ) / new_shares
+def show_message(success, message):
+    if success:
+        st.success(message)
     else:
-        new_avg = ask_price
+        st.error(message)
 
-    holding["shares"] = new_shares
-    holding["avg_price"] = round(new_avg, 4)
 
-    transaction = {
-        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": symbol,
-        "type": "Köp",
-        "shares": shares,
-        "price": round(ask_price, 4),
-        "commission": round(commission, 2),
-        "total": round(total_cost, 2)
-    }
+# ============================================================
+# DATA
+# ============================================================
 
-    portfolio["transactions"].append(transaction)
+if "app_data" not in st.session_state:
+    st.session_state.app_data = load_data()
 
-    save_data()
+data = st.session_state.app_data
 
-    return True, (
-        f"Köpte {shares} {symbol} för "
-        f"{total_cost:,.2f} kr."
+if not data.get("portfolios"):
+    create_portfolio(
+        data,
+        "Min portfölj",
+        100000
     )
 
+portfolio_names = list(data["portfolios"].keys())
 
-# ============================================================
-# SELL
-# ============================================================
+if data.get("active_portfolio") not in portfolio_names:
+    data["active_portfolio"] = portfolio_names[0]
 
-def sell_stock(symbol, shares):
-    portfolio = current_portfolio()
-
-    if shares <= 0:
-        return False, "Antalet aktier måste vara större än 0."
-
-    if int(shares) != shares:
-        return False, "Du kan endast sälja hela aktier."
-
-    shares = int(shares)
-
-    if symbol not in portfolio["holdings"]:
-        return False, "Du äger inte den här aktien."
-
-    holding = portfolio["holdings"][symbol]
-
-    if shares > holding["shares"]:
-        return False, "Du äger inte så många aktier."
-
-    price = get_current_price(symbol)
-
-    if price is None:
-        return False, "Kunde inte hämta aktuell aktiekurs."
-
-    bid_price = price * 0.9995
-
-    subtotal = bid_price * shares
-    commission = subtotal * COMMISSION_RATE
-    received = subtotal - commission
-
-    portfolio["balance"] += received
-
-    holding["shares"] -= shares
-
-    if holding["shares"] <= 0:
-        del portfolio["holdings"][symbol]
-
-    transaction = {
-        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": symbol,
-        "type": "Sälj",
-        "shares": shares,
-        "price": round(bid_price, 4),
-        "commission": round(commission, 2),
-        "total": round(received, 2)
-    }
-
-    portfolio["transactions"].append(transaction)
-
-    save_data()
-
-    return True, (
-        f"Sålde {shares} {symbol} och fick "
-        f"{received:,.2f} kr."
-    )
-
-
-# ============================================================
-# STOP LOSS / TAKE PROFIT
-# ============================================================
-
-def check_orders():
-    portfolio = current_portfolio()
-
-    for symbol in list(portfolio["holdings"].keys()):
-
-        holding = portfolio["holdings"][symbol]
-
-        current_price = get_current_price(symbol)
-
-        if current_price is None:
-            continue
-
-        stop_loss = holding.get("stop_loss")
-        take_profit = holding.get("take_profit")
-
-        if stop_loss is not None and current_price <= stop_loss:
-
-            shares = holding["shares"]
-
-            sell_stock(symbol, shares)
-
-            st.warning(
-                f"STOP-LOSS utlöst för {symbol}."
-            )
-
-        elif take_profit is not None and current_price >= take_profit:
-
-            shares = holding["shares"]
-
-            sell_stock(symbol, shares)
-
-            st.success(
-                f"TAKE-PROFIT utlöst för {symbol}."
-            )
-
-
-# ============================================================
-# PORTFÖLJVÄRDE HISTORIK
-# ============================================================
-
-def save_performance():
-    portfolio = current_portfolio()
-
-    value = portfolio_value(portfolio)
-
-    portfolio["performance"].append({
-        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "value": round(value, 2)
-    })
-
-    # Behåll senaste 5000 mätningar
-    portfolio["performance"] = portfolio["performance"][-5000:]
-
-    save_data()
+active_name = data["active_portfolio"]
+portfolio = get_active_portfolio(data)
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("📈 StockTrader")
+with st.sidebar:
 
-st.sidebar.markdown("---")
+    st.title("Stock Trader")
 
-portfolio_names = list(st.session_state.portfolios.keys())
+    st.caption("Trading simulator")
 
-if "selected_portfolio" not in st.session_state:
-    st.session_state.selected_portfolio = portfolio_names[0]
+    st.divider()
 
-selected = st.sidebar.selectbox(
-    "Portfölj",
-    portfolio_names,
-    index=portfolio_names.index(
-        st.session_state.selected_portfolio
-    )
-)
+    st.subheader("Portfölj")
 
-st.session_state.selected_portfolio = selected
-
-st.sidebar.markdown("---")
-
-st.sidebar.subheader("Portföljer")
-
-with st.sidebar.expander("➕ Skapa ny portfölj"):
-
-    new_name = st.text_input(
-        "Portföljnamn"
+    selected_portfolio = st.selectbox(
+        "Välj portfölj",
+        portfolio_names,
+        index=portfolio_names.index(active_name),
+        label_visibility="collapsed",
     )
 
-    new_balance = st.number_input(
-        "Startkapital (kr)",
-        min_value=0.0,
-        value=50000.0,
-        step=1000.0
-    )
-
-    if st.button("Skapa portfölj", use_container_width=True):
-
-        if not new_name.strip():
-            st.error("Ange ett namn.")
-
-        elif new_name in st.session_state.portfolios:
-            st.error("Den portföljen finns redan.")
-
-        else:
-
-            st.session_state.portfolios[new_name] = {
-                "starting_balance": new_balance,
-                "balance": new_balance,
-                "holdings": {},
-                "transactions": [],
-                "performance": [],
-                "watchlist": [],
-                "created": datetime.now().isoformat()
-            }
-
-            st.session_state.selected_portfolio = new_name
-
-            save_data()
-
-            st.success("Portfölj skapad.")
-            st.rerun()
-
-
-with st.sidebar.expander("⚙️ Portföljinställningar"):
-
-    if st.button(
-        "Återställ denna portfölj",
-        use_container_width=True
-    ):
-
-        portfolio = current_portfolio()
-
-        portfolio["balance"] = portfolio["starting_balance"]
-        portfolio["holdings"] = {}
-        portfolio["transactions"] = []
-        portfolio["performance"] = []
-
-        save_data()
-
-        st.success("Portföljen återställd.")
+    if selected_portfolio != active_name:
+        data["active_portfolio"] = selected_portfolio
+        save_data(data)
+        st.session_state.app_data = data
         st.rerun()
 
+    st.divider()
 
-# ============================================================
-# WATCHLIST
-# ============================================================
+    with st.expander("Ny portfölj"):
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("⭐ Bevakningslista")
+        new_name = st.text_input(
+            "Namn"
+        )
 
-portfolio = current_portfolio()
+        new_capital = st.number_input(
+            "Startkapital",
+            min_value=1.0,
+            value=100000.0,
+            step=1000.0,
+        )
 
-for symbol in portfolio["watchlist"]:
+        if st.button(
+            "Skapa portfölj",
+            use_container_width=True
+        ):
 
-    price = get_current_price(symbol)
+            try:
+                create_portfolio(
+                    data,
+                    new_name,
+                    new_capital
+                )
 
-    if price is not None:
+                st.session_state.app_data = data
 
-        col1, col2 = st.sidebar.columns([2, 1])
-
-        with col1:
-            if st.button(
-                symbol,
-                key=f"watch_{symbol}",
-                use_container_width=True
-            ):
-                st.session_state.selected_stock = symbol
+                st.success("Portföljen skapades.")
+                time.sleep(0.5)
                 st.rerun()
 
-        with col2:
-            st.write(f"{price:.2f}")
+            except ValueError as error:
+                st.error(str(error))
+
+    with st.expander("Portföljinställningar"):
+
+        st.write(
+            f"**Startkapital:** {money(portfolio['starting_capital'])}"
+        )
+
+        if st.button(
+            "Återställ portfölj",
+            use_container_width=True
+        ):
+
+            reset_portfolio(
+                data,
+                portfolio["name"]
+            )
+
+            st.session_state.app_data = data
+            st.rerun()
+
+        if len(data["portfolios"]) > 1:
+
+            if st.button(
+                "Ta bort portfölj",
+                use_container_width=True
+            ):
+
+                try:
+                    delete_portfolio(
+                        data,
+                        portfolio["name"]
+                    )
+
+                    st.session_state.app_data = data
+                    st.rerun()
+
+                except ValueError as error:
+                    st.error(str(error))
+
+    st.divider()
+
+    st.caption("Ingen riktig order skickas.")
+    st.caption("Alla pengar och trades är simulerade.")
 
 
-watch_add = st.sidebar.text_input(
-    "Lägg till aktie",
-    placeholder="t.ex. TSLA"
-)
+# ============================================================
+# MARKNADSTICKER
+# ============================================================
 
-if st.sidebar.button(
-    "Lägg till",
-    use_container_width=True
-):
+indices = get_market_indices()
 
-    symbol = watch_add.upper().strip()
+if indices:
 
-    if symbol and symbol not in portfolio["watchlist"]:
+    cols = st.columns(len(indices))
 
-        portfolio["watchlist"].append(symbol)
+    for column, index_data in zip(cols, indices):
 
-        save_data()
+        with column:
 
-        st.rerun()
+            change = index_data["change_percent"]
+
+            st.metric(
+                index_data["name"],
+                f"{index_data['price']:,.2f}",
+                f"{change:+.2f}%"
+            )
 
 
 # ============================================================
 # HEADER
 # ============================================================
 
-st.title("📈 StockTrader")
+st.title("Stock Trader")
 
-st.caption(
-    "Aktiesimulator med riktiga marknadsdata • "
-    "2 % courtage • Ingen riktig order skickas"
+st.write(
+    f"Portfölj: **{portfolio['name']}**"
 )
 
+st.divider()
+
+
 # ============================================================
-# MARKNADS-TICKER
+# PORTFÖLJVÄRDE
 # ============================================================
 
-ticker_symbols = [
-    "^OMX",
-    "^GSPC",
-    "^IXIC",
-    "^DJI"
-]
+prices = get_prices_for_portfolio(portfolio)
 
-ticker_names = [
-    "OMXS",
-    "S&P 500",
-    "NASDAQ",
-    "DOW JONES"
-]
+portfolio_value = calculate_portfolio_value(
+    portfolio,
+    prices
+)
 
-ticker_cols = st.columns(4)
+starting_capital = portfolio["starting_capital"]
 
-for col, symbol, name in zip(
-    ticker_cols,
-    ticker_symbols,
-    ticker_names
-):
+total_pnl = portfolio_value - starting_capital
 
-    data = get_stock_data(
-        symbol,
-        "5d",
-        "1d"
+if starting_capital:
+    total_return = (
+        total_pnl / starting_capital
+    ) * 100
+else:
+    total_return = 0
+
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(
+        "Portföljvärde",
+        money(portfolio_value)
     )
 
-    if data is not None and not data.empty:
+with col2:
+    st.metric(
+        "Kontanter",
+        money(portfolio["cash"])
+    )
 
-        current = float(data["Close"].iloc[-1])
+with col3:
+    st.metric(
+        "P&L",
+        money(total_pnl),
+        percent(total_return)
+    )
 
-        if len(data) > 1:
-            previous = float(data["Close"].iloc[-2])
-            change = current - previous
-            percent = (change / previous) * 100
-        else:
-            change = 0
-            percent = 0
-
-        col.metric(
-            name,
-            f"{current:,.2f}",
-            f"{percent:+.2f}%"
-        )
+with col4:
+    st.metric(
+        "Antal positioner",
+        len(portfolio["holdings"])
+    )
 
 
 # ============================================================
-# PORTFÖLJ-METRICS
+# UPPDATERA HISTORIK
 # ============================================================
 
-st.markdown("---")
+update_value_history(portfolio)
+update_portfolio(data, portfolio)
 
-p_value = portfolio_value(portfolio)
-cash = portfolio["balance"]
-stocks_value = holdings_value(portfolio)
-pnl = p_value - portfolio["starting_balance"]
+st.session_state.app_data = data
 
-pnl_percent = (
-    (pnl / portfolio["starting_balance"]) * 100
-    if portfolio["starting_balance"] > 0
-    else 0
-)
 
-m1, m2, m3, m4 = st.columns(4)
+# ============================================================
+# FLikar
+# ============================================================
 
-m1.metric(
-    "Portföljvärde",
-    f"{p_value:,.2f} kr"
-)
-
-m2.metric(
-    "Kontanter",
-    f"{cash:,.2f} kr"
-)
-
-m3.metric(
-    "Aktier",
-    f"{stocks_value:,.2f} kr"
-)
-
-m4.metric(
-    "Total P/L",
-    f"{pnl:,.2f} kr",
-    f"{pnl_percent:+.2f}%"
+tab_trade, tab_chart, tab_portfolio, tab_stats, tab_history, tab_watchlist = st.tabs(
+    [
+        "Trade",
+        "Chart",
+        "Portfolio",
+        "Statistics",
+        "History",
+        "Watchlist",
+    ]
 )
 
 
 # ============================================================
-# AKTIESÖKNING
+# TRADE
 # ============================================================
 
-st.markdown("---")
+with tab_trade:
 
-st.subheader("🔎 Sök efter aktie")
-
-search_col1, search_col2 = st.columns([4, 1])
-
-with search_col1:
+    st.subheader("Trade")
 
     search_query = st.text_input(
-        "Sök",
-        placeholder="Sök på aktienamn eller ticker, t.ex. Nvidia, Volvo, Apple...",
-        label_visibility="collapsed"
+        "Sök aktie",
+        placeholder="Exempel: Apple, Tesla, Volvo, Nvidia..."
     )
 
-with search_col2:
+    search_results = []
 
-    search_button = st.button(
-        "Sök",
-        use_container_width=True
-    )
+    if search_query:
 
+        search_results = search_stocks(
+            search_query
+        )
 
-if search_button and search_query:
+    if search_results:
 
-    results = search_stocks(search_query)
-
-    if results:
-        st.session_state.search_results = results
-    else:
-        st.warning("Inga aktier hittades.")
-
-
-if st.session_state.search_results:
-
-    st.write("**Sökresultat:**")
-
-    for result in st.session_state.search_results:
-
-        col1, col2, col3 = st.columns([2, 5, 2])
-
-        with col1:
-            st.write(f"**{result['symbol']}**")
-
-        with col2:
-            st.write(result["name"])
-
-        with col3:
-
-            if st.button(
-                "Öppna",
-                key=f"open_{result['symbol']}"
-            ):
-
-                st.session_state.selected_stock = result["symbol"]
-                st.session_state.search_results = []
-
-                st.rerun()
-
-
-# ============================================================
-# VALD AKTIE
-# ============================================================
-
-symbol = st.session_state.selected_stock
-
-info = get_stock_info(symbol)
-
-st.markdown("---")
-
-st.header(
-    f"{info['name']} ({symbol})"
-)
-
-st.caption(
-    f"Börs: {info['exchange']} • "
-    f"Valuta: {info['currency']}"
-)
-
-
-# ============================================================
-# AKTIEPRIS
-# ============================================================
-
-stock_data = get_stock_data(
-    symbol,
-    "1d",
-    "1m"
-)
-
-if stock_data is None or stock_data.empty:
-
-    st.error(
-        "Kunde inte hämta data för denna aktie."
-    )
-
-    st.stop()
-
-
-current_price = float(
-    stock_data["Close"].iloc[-1]
-)
-
-previous_close = float(
-    stock_data["Close"].iloc[0]
-)
-
-price_change = current_price - previous_close
-
-price_percent = (
-    price_change / previous_close * 100
-    if previous_close != 0
-    else 0
-)
-
-price_col1, price_col2, price_col3, price_col4 = st.columns(4)
-
-price_col1.metric(
-    "Senaste kurs",
-    f"{current_price:,.2f}"
-)
-
-price_col2.metric(
-    "Förändring",
-    f"{price_change:+,.2f}",
-    f"{price_percent:+.2f}%"
-)
-
-bid = current_price * 0.9995
-ask = current_price * 1.0005
-
-price_col3.metric(
-    "Bid",
-    f"{bid:,.2f}"
-)
-
-price_col4.metric(
-    "Ask",
-    f"{ask:,.2f}"
-)
-
-
-# ============================================================
-# GRAF
-# ============================================================
-
-st.markdown("---")
-
-chart_col1, chart_col2 = st.columns([5, 1])
-
-with chart_col1:
-
-    st.subheader("📊 Kursgraf")
-
-with chart_col2:
-
-    timeframe = st.selectbox(
-        "Intervall",
-        [
-            "1 minut",
-            "5 minuter",
-            "15 minuter",
-            "1 timme",
-            "1 dag"
+        options = [
+            f"{result['symbol']} — {result['name']}"
+            for result in search_results
         ]
-    )
 
-
-if timeframe == "1 minut":
-    period = "1d"
-    interval = "1m"
-
-elif timeframe == "5 minuter":
-    period = "5d"
-    interval = "5m"
-
-elif timeframe == "15 minuter":
-    period = "5d"
-    interval = "15m"
-
-elif timeframe == "1 timme":
-    period = "1mo"
-    interval = "1h"
-
-else:
-    period = "1y"
-    interval = "1d"
-
-
-chart_data = get_stock_data(
-    symbol,
-    period,
-    interval
-)
-
-
-if chart_data is not None and not chart_data.empty:
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=chart_data.index,
-            open=chart_data["Open"],
-            high=chart_data["High"],
-            low=chart_data["Low"],
-            close=chart_data["Close"],
-            name=symbol
-        )
-    )
-
-    fig.update_layout(
-        template="plotly_dark",
-        height=550,
-        margin=dict(
-            l=10,
-            r=10,
-            t=20,
-            b=10
-        ),
-        xaxis_rangeslider_visible=False,
-        paper_bgcolor="#0b0f14",
-        plot_bgcolor="#0b0f14"
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
-
-
-# ============================================================
-# TRADING
-# ============================================================
-
-st.markdown("---")
-
-trade_col, position_col = st.columns([1, 1])
-
-with trade_col:
-
-    st.subheader("⚡ Handla")
-
-    shares = st.number_input(
-        "Antal aktier",
-        min_value=1,
-        value=1,
-        step=1
-    )
-
-    estimated_buy = ask * shares
-    buy_fee = estimated_buy * COMMISSION_RATE
-    buy_total = estimated_buy + buy_fee
-
-    estimated_sell = bid * shares
-    sell_fee = estimated_sell * COMMISSION_RATE
-    sell_total = estimated_sell - sell_fee
-
-    st.markdown(
-        f"""
-        **Köp**
-
-        Kurs: `{ask:,.2f} kr`  
-        Aktier: `{shares}`  
-        Courtage (2 %): `{buy_fee:,.2f} kr`  
-        **Totalt: `{buy_total:,.2f} kr`**
-        """
-    )
-
-    if st.button(
-        "🟢 KÖP",
-        use_container_width=True
-    ):
-
-        success, message = buy_stock(
-            symbol,
-            shares
+        selected_result = st.selectbox(
+            "Välj aktie",
+            options
         )
 
-        if success:
-            st.success(message)
-            st.rerun()
-        else:
-            st.error(message)
-
-    st.markdown("---")
-
-    st.markdown(
-        f"""
-        **Sälj**
-
-        Kurs: `{bid:,.2f} kr`  
-        Aktier: `{shares}`  
-        Courtage (2 %): `{sell_fee:,.2f} kr`  
-        **Du får: `{sell_total:,.2f} kr`**
-        """
-    )
-
-    if st.button(
-        "🔴 SÄLJ",
-        use_container_width=True
-    ):
-
-        success, message = sell_stock(
-            symbol,
-            shares
+        selected_index = options.index(
+            selected_result
         )
 
-        if success:
-            st.success(message)
-            st.rerun()
-        else:
-            st.error(message)
+        selected_stock = search_results[
+            selected_index
+        ]
 
-
-# ============================================================
-# STOP LOSS / TAKE PROFIT
-# ============================================================
-
-with position_col:
-
-    st.subheader("🎯 Riskhantering")
-
-    if symbol in portfolio["holdings"]:
-
-        holding = portfolio["holdings"][symbol]
-
-        owned = holding["shares"]
-        avg_price = holding["avg_price"]
-
-        st.metric(
-            "Du äger",
-            f"{owned} aktier"
-        )
-
-        st.metric(
-            "Genomsnittligt inköpspris",
-            f"{avg_price:,.2f} kr"
-        )
-
-        position_pnl = (
-            current_price - avg_price
-        ) * owned
-
-        position_percent = (
-            (current_price - avg_price)
-            / avg_price
-            * 100
-            if avg_price != 0
-            else 0
-        )
-
-        st.metric(
-            "P/L på position",
-            f"{position_pnl:,.2f} kr",
-            f"{position_percent:+.2f}%"
-        )
-
-        st.markdown("---")
-
-        stop_loss = st.number_input(
-            "Stop-loss",
-            min_value=0.0,
-            value=float(
-                holding.get("stop_loss") or 0
-            ),
-            step=0.01
-        )
-
-        take_profit = st.number_input(
-            "Take-profit",
-            min_value=0.0,
-            value=float(
-                holding.get("take_profit") or 0
-            ),
-            step=0.01
-        )
-
-        if st.button(
-            "Spara risknivåer",
-            use_container_width=True
-        ):
-
-            holding["stop_loss"] = (
-                stop_loss if stop_loss > 0 else None
-            )
-
-            holding["take_profit"] = (
-                take_profit if take_profit > 0 else None
-            )
-
-            save_data()
-
-            st.success(
-                "Risknivåerna har sparats."
-            )
-            st.rerun()
+        symbol = selected_stock["symbol"]
 
     else:
 
-        st.info(
-            "Du äger inte denna aktie ännu."
+        held_symbols = list(
+            portfolio["holdings"].keys()
         )
 
+        if held_symbols:
 
-# ============================================================
-# PORTFÖLJFÖRDELNING
-# ============================================================
+            symbol = st.selectbox(
+                "Aktie",
+                held_symbols
+            )
 
-st.markdown("---")
+        else:
 
-allocation_col, performance_col = st.columns(2)
+            symbol = st.text_input(
+                "Aktiesymbol",
+                placeholder="Exempel: AAPL"
+            ).upper().strip()
 
-with allocation_col:
+    if symbol:
 
-    st.subheader("🥧 Tillgångsfördelning")
+        current_price = get_current_price(
+            symbol
+        )
 
-    labels = ["Kontanter"]
-    values = [cash]
+        bid, ask, spread = get_bid_ask(
+            symbol
+        )
 
-    for stock_symbol, holding in portfolio["holdings"].items():
+        if current_price is None:
 
-        price = get_current_price(stock_symbol)
+            st.warning(
+                "Kunde inte hämta priset för denna aktie."
+            )
 
-        if price is not None:
+        else:
 
-            value = holding["shares"] * price
+            price_col1, price_col2, price_col3 = st.columns(3)
 
-            labels.append(stock_symbol)
-            values.append(value)
-
-    if sum(values) > 0:
-
-        pie = go.Figure(
-            data=[
-                go.Pie(
-                    labels=labels,
-                    values=values,
-                    hole=0.55
+            with price_col1:
+                st.metric(
+                    "Senaste pris",
+                    money(current_price)
                 )
+
+            with price_col2:
+
+                if bid is not None:
+                    st.metric(
+                        "Bid",
+                        money(bid)
+                    )
+
+            with price_col3:
+
+                if ask is not None:
+                    st.metric(
+                        "Ask",
+                        money(ask)
+                    )
+
+            st.divider()
+
+            trade_col1, trade_col2 = st.columns(2)
+
+            with trade_col1:
+
+                st.subheader("Köp")
+
+                buy_shares = st.number_input(
+                    "Antal aktier",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key=f"buy_{symbol}"
+                )
+
+                buy_stop = st.number_input(
+                    "Stop-loss",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.01,
+                    key=f"buy_stop_{symbol}"
+                )
+
+                buy_target = st.number_input(
+                    "Take-profit",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.01,
+                    key=f"buy_target_{symbol}"
+                )
+
+                if ask is not None:
+
+                    estimated_value = (
+                        ask * buy_shares
+                    )
+
+                    estimated_commission = (
+                        estimated_value * 0.02
+                    )
+
+                    estimated_total = (
+                        estimated_value
+                        + estimated_commission
+                    )
+
+                    st.caption(
+                        f"Pris: {money(estimated_value)}"
+                    )
+
+                    st.caption(
+                        f"Courtage 2%: {money(estimated_commission)}"
+                    )
+
+                    st.caption(
+                        f"Totalt: {money(estimated_total)}"
+                    )
+
+                if st.button(
+                    "Köp",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"buy_button_{symbol}"
+                ):
+
+                    success, message = buy_stock(
+                        portfolio,
+                        symbol,
+                        buy_shares,
+                        current_price,
+                        stop_loss=(
+                            buy_stop
+                            if buy_stop > 0
+                            else None
+                        ),
+                        take_profit=(
+                            buy_target
+                            if buy_target > 0
+                            else None
+                        )
+                    )
+
+                    show_message(
+                        success,
+                        message
+                    )
+
+                    if success:
+
+                        update_portfolio(
+                            data,
+                            portfolio
+                        )
+
+                        st.session_state.app_data = data
+
+                        time.sleep(0.3)
+                        st.rerun()
+
+            with trade_col2:
+
+                st.subheader("Sälj")
+
+                owned = portfolio["holdings"].get(
+                    symbol
+                )
+
+                if owned:
+
+                    owned_shares = owned["shares"]
+
+                    st.write(
+                        f"Du äger **{owned_shares}** aktier."
+                    )
+
+                    st.write(
+                        f"Snittpris: "
+                        f"**{money(owned['average_price'])}**"
+                    )
+
+                    sell_shares = st.number_input(
+                        "Antal att sälja",
+                        min_value=1,
+                        max_value=int(owned_shares),
+                        value=1,
+                        step=1,
+                        key=f"sell_{symbol}"
+                    )
+
+                    if bid is not None:
+
+                        estimated_value = (
+                            bid * sell_shares
+                        )
+
+                        estimated_commission = (
+                            estimated_value * 0.02
+                        )
+
+                        estimated_total = (
+                            estimated_value
+                            - estimated_commission
+                        )
+
+                        st.caption(
+                            f"Försäljningsvärde: "
+                            f"{money(estimated_value)}"
+                        )
+
+                        st.caption(
+                            f"Courtage 2%: "
+                            f"{money(estimated_commission)}"
+                        )
+
+                        st.caption(
+                            f"Du får: "
+                            f"{money(estimated_total)}"
+                        )
+
+                    if st.button(
+                        "Sälj",
+                        use_container_width=True,
+                        key=f"sell_button_{symbol}"
+                    ):
+
+                        success, message = sell_stock(
+                            portfolio,
+                            symbol,
+                            sell_shares,
+                            current_price
+                        )
+
+                        show_message(
+                            success,
+                            message
+                        )
+
+                        if success:
+
+                            update_portfolio(
+                                data,
+                                portfolio
+                            )
+
+                            st.session_state.app_data = data
+
+                            time.sleep(0.3)
+                            st.rerun()
+
+                else:
+
+                    st.info(
+                        "Du äger inte den här aktien."
+                    )
+
+
+# ============================================================
+# CHART
+# ============================================================
+
+with tab_chart:
+
+    st.subheader("Marknad")
+
+    chart_symbol = st.text_input(
+        "Aktiesymbol",
+        value=(
+            symbol
+            if "symbol" in locals()
+            and symbol
+            else "AAPL"
+        )
+    ).upper().strip()
+
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+
+        interval = st.selectbox(
+            "Intervall",
+            [
+                "1m",
+                "5m",
+                "1h",
+                "1d",
             ]
         )
 
-        pie.update_layout(
-            template="plotly_dark",
-            height=400,
-            paper_bgcolor="#0b0f14"
+    with chart_col2:
+
+        period = st.selectbox(
+            "Period",
+            [
+                "1d",
+                "5d",
+                "1mo",
+                "3mo",
+                "6mo",
+                "1y",
+            ]
         )
 
-        st.plotly_chart(
-            pie,
-            use_container_width=True
+    interval_periods = {
+        "1m": ["1d", "5d"],
+        "5m": ["1d", "5d", "1mo"],
+        "1h": ["5d", "1mo", "3mo", "6mo"],
+        "1d": ["1mo", "3mo", "6mo", "1y"],
+    }
+
+    allowed_periods = interval_periods[
+        interval
+    ]
+
+    if period not in allowed_periods:
+        period = allowed_periods[0]
+
+    data_chart = get_stock_data(
+        chart_symbol,
+        period=period,
+        interval=interval
+    )
+
+    if data_chart.empty:
+
+        st.warning(
+            "Ingen kursdata kunde hämtas."
         )
+
+    else:
+
+        candle = candlestick_chart(
+            data_chart,
+            chart_symbol
+        )
+
+        if candle:
+            st.plotly_chart(
+                candle,
+                use_container_width=True
+            )
+
+        volume = volume_chart(
+            data_chart
+        )
+
+        if volume:
+            st.plotly_chart(
+                volume,
+                use_container_width=True
+            )
 
 
 # ============================================================
-# PORTFÖLJUTVECKLING
+# PORTFOLIO
 # ============================================================
 
-with performance_col:
+with tab_portfolio:
 
-    st.subheader("📈 Portföljutveckling")
+    st.subheader("Portfolio")
 
-    save_performance()
+    prices = get_prices_for_portfolio(
+        portfolio
+    )
 
-    performance = portfolio["performance"]
+    if not portfolio["holdings"]:
 
-    if performance:
-
-        df = pd.DataFrame(performance)
-
-        df["datetime"] = pd.to_datetime(
-            df["datetime"]
+        st.info(
+            "Din portfölj är tom."
         )
 
-        line = go.Figure()
+    else:
 
-        line.add_trace(
-            go.Scatter(
-                x=df["datetime"],
-                y=df["value"],
-                mode="lines",
-                name="Portföljvärde"
+        rows = []
+
+        for stock_symbol, holding in portfolio[
+            "holdings"
+        ].items():
+
+            current = prices.get(
+                stock_symbol
+            )
+
+            if current is None:
+                continue
+
+            position = calculate_position_pnl(
+                holding,
+                current
+            )
+
+            rows.append(
+                {
+                    "Aktie": stock_symbol,
+                    "Antal": holding["shares"],
+                    "Snittpris": money(
+                        holding["average_price"]
+                    ),
+                    "Pris": money(current),
+                    "Värde": money(
+                        position["current_value"]
+                    ),
+                    "P&L": money(
+                        position["pnl"]
+                    ),
+                    "P&L %": percent(
+                        position["pnl_percent"]
+                    ),
+                    "Stop-loss": (
+                        money(holding["stop_loss"])
+                        if holding.get("stop_loss")
+                        else "-"
+                    ),
+                    "Take-profit": (
+                        money(holding["take_profit"])
+                        if holding.get("take_profit")
+                        else "-"
+                    ),
+                }
+            )
+
+        if rows:
+
+            portfolio_df = pd.DataFrame(
+                rows
+            )
+
+            st.dataframe(
+                portfolio_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+    st.divider()
+
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+
+        allocation = allocation_chart(
+            portfolio,
+            prices
+        )
+
+        if allocation:
+            st.plotly_chart(
+                allocation,
+                use_container_width=True
+            )
+
+    with chart_col2:
+
+        performance = portfolio_value_chart(
+            portfolio.get(
+                "value_history",
+                []
             )
         )
 
-        line.update_layout(
-            template="plotly_dark",
-            height=400,
-            paper_bgcolor="#0b0f14",
-            plot_bgcolor="#0b0f14",
-            yaxis_title="Värde (kr)",
-            xaxis_title=""
+        if performance:
+            st.plotly_chart(
+                performance,
+                use_container_width=True
+            )
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+with tab_stats:
+
+    st.subheader("Trading Statistics")
+
+    stats = calculate_statistics(
+        portfolio
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(
+            "Trades",
+            stats["total_trades"]
         )
 
+    with col2:
+        st.metric(
+            "Win rate",
+            f"{stats['win_rate']:.2f}%"
+        )
+
+    with col3:
+        st.metric(
+            "Realiserad P&L",
+            money(
+                stats["total_realized_pnl"]
+            )
+        )
+
+    col4, col5 = st.columns(2)
+
+    with col4:
+        st.metric(
+            "Största vinst",
+            money(
+                stats["biggest_win"]
+            )
+        )
+
+    with col5:
+        st.metric(
+            "Största förlust",
+            money(
+                stats["biggest_loss"]
+            )
+        )
+
+    pnl = pnl_chart(
+        portfolio.get(
+            "transactions",
+            []
+        )
+    )
+
+    if pnl:
         st.plotly_chart(
-            line,
+            pnl,
             use_container_width=True
         )
 
+    st.info(
+        "Win rate räknas från avslutade säljtrades."
+    )
+
 
 # ============================================================
-# INNEHAV
+# HISTORY
 # ============================================================
 
-st.markdown("---")
+with tab_history:
 
-st.subheader("💼 Mina innehav")
+    st.subheader("Transaction History")
 
-if portfolio["holdings"]:
+    transaction_df = format_transaction_table(
+        portfolio.get(
+            "transactions",
+            []
+        )
+    )
 
-    rows = []
+    if transaction_df.empty:
 
-    for stock_symbol, holding in portfolio["holdings"].items():
-
-        price = get_current_price(stock_symbol)
-
-        if price is None:
-            continue
-
-        shares_owned = holding["shares"]
-        avg_price = holding["avg_price"]
-
-        value = price * shares_owned
-
-        pnl_value = (
-            price - avg_price
-        ) * shares_owned
-
-        pnl_pct = (
-            (price - avg_price)
-            / avg_price
-            * 100
-            if avg_price != 0
-            else 0
+        st.info(
+            "Inga trades har gjorts ännu."
         )
 
-        rows.append({
-            "Aktie": stock_symbol,
-            "Antal": shares_owned,
-            "Snittpris": f"{avg_price:,.2f} kr",
-            "Aktuell kurs": f"{price:,.2f} kr",
-            "Värde": f"{value:,.2f} kr",
-            "P/L": f"{pnl_value:+,.2f} kr",
-            "P/L %": f"{pnl_pct:+.2f}%"
-        })
+    else:
 
-    if rows:
         st.dataframe(
-            pd.DataFrame(rows),
+            transaction_df,
             use_container_width=True,
             hide_index=True
         )
 
-else:
-
-    st.info(
-        "Du har inga aktier i denna portfölj."
-    )
-
 
 # ============================================================
-# TRANSAKTIONSLOGG
+# WATCHLIST
 # ============================================================
 
-st.markdown("---")
+with tab_watchlist:
 
-st.subheader("📝 Transaktionslogg")
+    st.subheader("Watchlist")
 
-transactions = portfolio["transactions"]
+    if "watchlist" not in st.session_state:
 
-if transactions:
+        st.session_state.watchlist = [
+            "AAPL",
+            "NVDA",
+            "TSLA",
+            "MSFT",
+            "VOLV-B.ST",
+        ]
 
-    transaction_df = pd.DataFrame(
-        transactions[::-1]
-    )
+    watch_input = st.text_input(
+        "Lägg till aktie",
+        placeholder="Exempel: AMD"
+    ).upper().strip()
 
-    transaction_df.columns = [
-        "Datum/Tid",
-        "Aktie",
-        "Typ",
-        "Antal",
-        "Kurs",
-        "Courtage",
-        "Total"
-    ]
+    if st.button(
+        "Lägg till"
+    ):
 
-    transaction_df["Kurs"] = (
-        transaction_df["Kurs"]
-        .map(lambda x: f"{x:,.2f} kr")
-    )
+        if (
+            watch_input
+            and watch_input
+            not in st.session_state.watchlist
+        ):
 
-    transaction_df["Courtage"] = (
-        transaction_df["Courtage"]
-        .map(lambda x: f"{x:,.2f} kr")
-    )
-
-    transaction_df["Total"] = (
-        transaction_df["Total"]
-        .map(lambda x: f"{x:,.2f} kr")
-    )
-
-    st.dataframe(
-        transaction_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-else:
-
-    st.info(
-        "Inga transaktioner ännu."
-    )
-
-
-# ============================================================
-# TRADING-STATISTIK
-# ============================================================
-
-st.markdown("---")
-
-st.subheader("📊 Trading-statistik")
-
-transactions = portfolio["transactions"]
-
-buy_transactions = [
-    x for x in transactions
-    if x["type"] == "Köp"
-]
-
-sell_transactions = [
-    x for x in transactions
-    if x["type"] == "Sälj"
-]
-
-total_trades = len(sell_transactions)
-
-realized_pnl = 0
-wins = 0
-losses = 0
-
-# Enkel FIFO-liknande beräkning
-open_positions = {}
-
-for transaction in transactions:
-
-    symbol_t = transaction["symbol"]
-
-    if symbol_t not in open_positions:
-        open_positions[symbol_t] = []
-
-    if transaction["type"] == "Köp":
-
-        open_positions[symbol_t].append({
-            "shares": transaction["shares"],
-            "price": transaction["price"]
-        })
-
-    elif transaction["type"] == "Sälj":
-
-        remaining = transaction["shares"]
-        sell_price = transaction["price"]
-
-        while remaining > 0 and open_positions[symbol_t]:
-
-            lot = open_positions[symbol_t][0]
-
-            used = min(
-                remaining,
-                lot["shares"]
+            st.session_state.watchlist.append(
+                watch_input
             )
 
-            trade_pnl = (
-                sell_price - lot["price"]
-            ) * used
+            st.rerun()
 
-            realized_pnl += trade_pnl
+    st.divider()
 
-            if trade_pnl > 0:
-                wins += 1
+    watch_rows = []
 
-            else:
-                losses += 1
+    for watch_symbol in st.session_state.watchlist:
 
-            lot["shares"] -= used
-            remaining -= used
+        price = get_current_price(
+            watch_symbol
+        )
 
-            if lot["shares"] <= 0:
-                open_positions[symbol_t].pop(0)
+        if price is None:
+            continue
 
+        history = get_stock_data(
+            watch_symbol,
+            period="2d",
+            interval="1d"
+        )
 
-win_rate = (
-    wins / (wins + losses) * 100
-    if wins + losses > 0
-    else 0
-)
+        change_percent = 0
 
-s1, s2, s3, s4 = st.columns(4)
+        if len(history) >= 2:
 
-s1.metric(
-    "Stängda positioner",
-    str(total_trades)
-)
+            previous = float(
+                history["Close"].iloc[-2]
+            )
 
-s2.metric(
-    "Win rate",
-    f"{win_rate:.2f}%"
-)
+            change_percent = (
+                (price - previous)
+                / previous
+                * 100
+            )
 
-s3.metric(
-    "Realiserad P/L",
-    f"{realized_pnl:+,.2f} kr"
-)
+        watch_rows.append(
+            {
+                "Symbol": watch_symbol,
+                "Pris": money(price),
+                "Förändring": percent(
+                    change_percent
+                ),
+            }
+        )
 
-s4.metric(
-    "Totalt antal köp",
-    str(len(buy_transactions))
-)
+    if watch_rows:
+
+        watch_df = pd.DataFrame(
+            watch_rows
+        )
+
+        st.dataframe(
+            watch_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.info(
+            "Ingen watchlist-data kunde hämtas."
+        )
 
 
 # ============================================================
-# INFO
+# STOP-LOSS / TAKE-PROFIT
 # ============================================================
 
-st.markdown("---")
-
-st.caption(
-    "StockTrader är en utbildningssimulator. "
-    "Marknadsdata hämtas från Yahoo Finance via yfinance. "
-    "Inga riktiga köp eller säljorder skickas till börsen. "
-    "Marknadsdata kan vara fördröjd beroende på börs och datakälla."
+prices = get_prices_for_portfolio(
+    portfolio
 )
 
+triggered_orders = check_stop_take_profit(
+    portfolio,
+    prices
+)
 
-# ============================================================
-# AUTOMATISK KONTROLL AV STOP-LOSS / TAKE-PROFIT
-# ============================================================
+if triggered_orders:
 
-try:
-    check_orders()
-except Exception:
-    pass
+    for order in triggered_orders:
+
+        st.warning(
+            f"{order['reason']}: "
+            f"{order['symbol']} såldes automatiskt."
+        )
+
+    update_portfolio(
+        data,
+        portfolio
+    )
+
+    st.session_state.app_data = data
 ```
-
-### `requirements.txt`
-
-```text
-streamlit>=1.40.0
-yfinance>=0.2.50
-pandas>=2.0.0
-numpy>=1.24.0
-plotly>=5.20.0
-```
-
-### Så fungerar den
-
-1. **Skapa portfölj** → välj namn och startkapital.
-2. **Sök aktie** → exempelvis `Nvidia`, `Apple`, `Volvo`, `Tesla`.
-3. Tryck **Öppna**.
-4. Du får aktuell marknadsdata och candlestick-graf.
-5. Välj antal aktier.
-6. **KÖP** använder Ask-priset.
-7. **SÄLJ** använder Bid-priset.
-8. **2 % courtage** dras automatiskt.
-9. Alla portföljer har separata pengar, innehav och transaktioner.
-10. Stop-loss och take-profit sparas per innehav.
-11. Allt sparas i `portfolios.json`.
-
-**Obs:** "riktiga börskurser" betyder här marknadsdata från Yahoo Finance. Beroende på marknad kan kurserna vara fördröjda. Simulatorn skickar aldrig riktiga order till börsen.
