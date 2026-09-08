@@ -1,4 +1,4 @@
-```python
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -1223,4 +1223,4 @@ if triggered_orders:
     )
 
     st.session_state.app_data = data
-```
+
